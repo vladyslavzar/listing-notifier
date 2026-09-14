@@ -26,9 +26,10 @@ def run_flask():
 threading.Thread(target=run_flask, daemon=True).start()
 # ----------------------------------
 
-SCRAPE_DELAY_MIN = 3
-SCRAPE_DELAY_MAX = 6
-REPEAT_DELAY = 300
+# Increased delays to comfortably stay within free-tier rate limits
+SCRAPE_DELAY_MIN = 5
+SCRAPE_DELAY_MAX = 10
+REPEAT_DELAY = 600
 MAX_AGE_DAYS = 14  # Cutoff for old listings
 
 dotenv.load_dotenv()
@@ -88,7 +89,7 @@ def is_listing_too_old(offer: dict, max_days=MAX_AGE_DAYS) -> bool:
         return False
 
 def analyze_listing_with_gemini(title: str, price: float, description: str = "") -> dict:
-    """Uses Gemini to spot massive price anomalies, calculating discount percentage and bargain ratings (1-10) against estimated used market value."""
+    """Uses Gemini Flash-Lite to spot massive price anomalies, calculating discount percentage and bargain ratings (1-10) against estimated used market value."""
     if not gemini_client:
         return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "Gemini client uninitialized (missing API key)"}
 
@@ -115,7 +116,7 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
     """
     try:
         response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.5-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -128,7 +129,7 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
         return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "API check skipped"}
 
 INITIAL_RUN = True
-print("[INIT] Initialization complete with pure misprice hunter pipeline (.env secured). Starting scraper loop...", flush=True)
+print("[INIT] Initialization complete with Flash-Lite pipeline (.env secured). Starting scraper loop...", flush=True)
 
 while True:
     print("\n--- Starting new OLX scrape cycle ---", flush=True)
@@ -216,7 +217,7 @@ while True:
                     print(f"    [SEEDING] Cached existing listing: {title} ({price} PLN)", flush=True)
                     continue
 
-                # 3. Pure Misprice Anomaly Evaluation via Gemini API
+                # 3. Pure Misprice Anomaly Evaluation via Gemini Flash-Lite API
                 print(f"    [AI ANALYZING] Checking misprice anomaly: {title}", flush=True)
                 analysis = analyze_listing_with_gemini(title, price)
 
