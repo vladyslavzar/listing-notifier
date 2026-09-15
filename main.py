@@ -3,6 +3,7 @@ import json
 import time
 import random
 import html
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 import dotenv
@@ -58,6 +59,13 @@ headers = {
     'Sec-Fetch-User': '?1',
     'Cache-Control': 'max-age=0'
 }
+
+def clean_description(raw_desc: str) -> str:
+    """Strips HTML tags from description string if present."""
+    if not raw_desc:
+        return ""
+    clean_text = re.sub(r'<[^>]+>', ' ', str(raw_desc))
+    return ' '.join(clean_text.split())
 
 def enforce_newest_sort(url: str) -> str:
     """Ensures search[order]=created_at:desc is appended to the OLX URL."""
@@ -197,6 +205,10 @@ while True:
                 title = offer.get('title', '')
                 offer_url = offer.get('url', '')
 
+                # Extract and clean listing description
+                raw_description = offer.get('description') or offer.get('snippet') or offer.get('textContent') or ''
+                description = clean_description(raw_description)
+
                 price_obj = offer.get("price") or {}
                 regular_price = price_obj.get("regularPrice") or {}
                 price = regular_price.get("value", 0)
@@ -215,7 +227,7 @@ while True:
                     continue
 
                 print(f"    [AI ANALYZING] Checking misprice anomaly: {title}", flush=True)
-                analysis = analyze_listing_with_gemini(title, price)
+                analysis = analyze_listing_with_gemini(title, price, description)
 
                 rating = analysis.get('bargain_rating', 0)
                 discount = analysis.get('discount_percentage', 0)
