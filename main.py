@@ -4,6 +4,7 @@ import time
 import random
 import html
 import re
+import itertools
 import threading
 from datetime import datetime, timedelta, timezone
 import dotenv
@@ -12,6 +13,7 @@ from curl_cffi import requests
 from telegram_notifier import Notifier
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 
 # --- RENDER HEALTH-CHECK SERVER ---
 app = Flask(__name__)
@@ -30,13 +32,22 @@ threading.Thread(target=run_flask, daemon=True).start()
 SCRAPE_DELAY_MIN = 5
 SCRAPE_DELAY_MAX = 10
 REPEAT_DELAY = 600
-MAX_AGE_DAYS = 14  # Cutoff for old listings
+MAX_AGE_DAYS = 2  # Cutoff: skip listings older than 2 days to prevent re-analyzing old bumped items
 
 dotenv.load_dotenv()
 notifier = Notifier()
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# --- GEMINI MULTI-KEY SETUP ---
+# Supports GEMINI_API_KEYS (comma-separated list) or falls back to single GEMINI_API_KEY
+raw_keys = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY") or ""
+api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+
+if api_keys:
+    key_pool = itertools.cycle(api_keys)
+    print(f"[INIT] Loaded {len(api_keys)} Gemini API key(s) into round-robin rotation.", flush=True)
+else:
+    key_pool = None
+    print("[INIT] Warning: No Gemini API keys found.", flush=True)
 
 try:
     with open("shown_ids.json", "r") as f:
@@ -75,7 +86,7 @@ def enforce_newest_sort(url: str) -> str:
     return f"{url}{separator}search%5Border%5D=created_at%3Adesc"
 
 def is_listing_too_old(offer: dict, max_days=MAX_AGE_DAYS) -> bool:
-    """Checks created_time or pushup_time to skip listings older than MAX_AGE_DAYS."""
+    """Checks created_time or pushup_time to skip listings older than max_days."""
     raw_time = offer.get("created_time") or offer.get("pushup_time") or offer.get("created_at")
     if not raw_time:
         return False
@@ -94,9 +105,9 @@ def is_listing_too_old(offer: dict, max_days=MAX_AGE_DAYS) -> bool:
         return False
 
 def analyze_listing_with_gemini(title: str, price: float, description: str = "") -> dict:
-    """Uses Gemini 3.5 Flash-Lite with rigorous guitar valuation constraints."""
-    if not gemini_client:
-        return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "Gemini client uninitialized"}
+    """Uses Gemini 3.5 Flash-Lite with multi-key round-robin rotation and automatic failover."""
+    if not key_pool:
+        return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "Gemini uninitialized"}
 
     prompt = f"""
     Analyze this OLX guitar listing to determine if it is a genuine, massive price anomaly or mispriced deal in the Polish used guitar market.
@@ -124,19 +135,32 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
         "verdict": "Short explanation specifying exact detected sub-series, realistic used market value in PLN, and discount rationale."
     }}
     """
-    try:
-        response = gemini_client.models.generate_content(
-            model='gemini-3.5-flash-lite',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1
-            ),
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        print(f"    [GEMINI ERROR] Failed to analyze listing: {e}", flush=True)
-        return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "API check skipped"}
+
+    # Attempt request across available key pool
+    for _ in range(len(api_keys)):
+        current_key = next(key_pool)
+        try:
+            client = genai.Client(api_key=current_key)
+            response = client.models.generate_content(
+                model='gemini-3.5-flash-lite',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1
+                ),
+            )
+            return json.loads(response.text)
+        except APIError as e:
+            if getattr(e, 'code', None) == 429 or "429" in str(e):
+                print(f"    [GEMINI RATE LIMITED] Key starting with {current_key[:6]}... exhausted. Rotating to next key...", flush=True)
+                continue
+            print(f"    [GEMINI API ERROR] {e}", flush=True)
+            break
+        except Exception as e:
+            print(f"    [GEMINI ERROR] Unexpected error: {e}", flush=True)
+            break
+
+    return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "All Gemini API keys failed or rate-limited"}
 
 INITIAL_RUN = True
 print("[INIT] Starting scraper loop with HTML notification formatting...", flush=True)
@@ -195,9 +219,11 @@ while True:
 
                 offer_id = str(offer.get('id', ''))
 
+                # 1. Already analyzed/cached check
                 if offer_id in shown_ids:
                     continue
 
+                # 2. Fix A: Age check (Skip and cache if listing was created/bumped > MAX_AGE_DAYS ago)
                 if is_listing_too_old(offer):
                     shown_ids.add(offer_id)
                     continue
@@ -234,6 +260,8 @@ while True:
                 verdict = analysis.get('verdict', '')
 
                 if rating < 7 or discount < 30:
+                    # Mark non-bargains as checked so we don't re-query Gemini on next cycle
+                    shown_ids.add(offer_id)
                     print(f"    [SKIPPED] Not a heavy bargain — Rating: {rating}/10 | Discount: {discount}%", flush=True)
                     continue
 
@@ -241,7 +269,6 @@ while True:
                 log_line = f"    [MATCH FOUND] {title} | {price} PLN | Rating: {rating}/10 | Discount: {discount}% | {offer_url}"
                 print(log_line, flush=True)
 
-                # Safe HTML escaping for dynamic string injection
                 safe_title = html.escape(title)
                 safe_verdict = html.escape(str(verdict))
                 safe_url = html.escape(offer_url)
@@ -256,11 +283,11 @@ while True:
 
                 try:
                     notifier.send_message(message)
-                    # Only mark listing cached once successfully delivered
                     shown_ids.add(offer_id)
                 except Exception as send_err:
                     print(f"    [TELEGRAM ERROR] Could not deliver alert: {send_err}", flush=True)
 
+            # Persist cached IDs to JSON file after processing each search page
             with open("shown_ids.json", "w") as f:
                 f.write(json.dumps(list(shown_ids)))
 
