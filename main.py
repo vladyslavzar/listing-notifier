@@ -2,6 +2,7 @@ import os
 import json
 import time
 import random
+import html
 import threading
 from datetime import datetime, timedelta, timezone
 import dotenv
@@ -22,7 +23,6 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# Run Flask server as a daemon thread
 threading.Thread(target=run_flask, daemon=True).start()
 # ----------------------------------
 
@@ -34,11 +34,9 @@ MAX_AGE_DAYS = 14  # Cutoff for old listings
 dotenv.load_dotenv()
 notifier = Notifier()
 
-# Initialize Gemini Client safely using environment variable
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Load cache safely using a Set for O(1) lookup
 try:
     with open("shown_ids.json", "r") as f:
         shown_ids_list = json.loads(f.read())
@@ -60,22 +58,6 @@ headers = {
     'Sec-Fetch-User': '?1',
     'Cache-Control': 'max-age=0'
 }
-
-def escape_markdown_v2(text: str) -> str:
-    """Escapes reserved characters for Telegram MarkdownV2 format."""
-    if not text:
-        return ""
-    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    text_str = str(text)
-    for char in escape_chars:
-        text_str = text_str.replace(char, f'\\{char}')
-    return text_str
-
-def escape_url(url: str) -> str:
-    """Escapes characters inside Markdown link parenthesis."""
-    if not url:
-        return ""
-    return str(url).replace('\\', '\\\\').replace(')', '\\)')
 
 def enforce_newest_sort(url: str) -> str:
     """Ensures search[order]=created_at:desc is appended to the OLX URL."""
@@ -106,7 +88,7 @@ def is_listing_too_old(offer: dict, max_days=MAX_AGE_DAYS) -> bool:
 def analyze_listing_with_gemini(title: str, price: float, description: str = "") -> dict:
     """Uses Gemini 3.5 Flash-Lite to spot massive price anomalies."""
     if not gemini_client:
-        return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "Gemini client uninitialized (missing API key)"}
+        return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "Gemini client uninitialized"}
 
     prompt = f"""
     Analyze this OLX guitar listing to determine if it is a massive price anomaly or an extraordinarily mispriced bargain ("one-hit wonder"). 
@@ -125,7 +107,7 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
     Return a valid JSON object ONLY with the following structure:
     {{
         "bargain_rating": 1 to 10,
-        "discount_percentage": integer or float (e.g. 45),
+        "discount_percentage": integer or float,
         "verdict": "Short explanation detailing adequate used price vs asking price and discount percentage"
     }}
     """
@@ -144,7 +126,7 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
         return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "API check skipped"}
 
 INITIAL_RUN = True
-print("[INIT] Initialization complete with MarkdownV2-safe pipeline. Starting scraper loop...", flush=True)
+print("[INIT] Starting scraper loop with HTML notification formatting...", flush=True)
 
 while True:
     print("\n--- Starting new OLX scrape cycle ---", flush=True)
@@ -200,11 +182,9 @@ while True:
 
                 offer_id = str(offer.get('id', ''))
                 
-                # 1. Skip duplicates immediately via set
                 if offer_id in shown_ids:
                     continue
 
-                # 2. Skip listings older than MAX_AGE_DAYS
                 if is_listing_too_old(offer):
                     shown_ids.add(offer_id)
                     continue
@@ -212,7 +192,6 @@ while True:
                 title = offer.get('title', '')
                 offer_url = offer.get('url', '')
 
-                # Safe price parsing
                 price_obj = offer.get("price") or {}
                 regular_price = price_obj.get("regularPrice") or {}
                 price = regular_price.get("value", 0)
@@ -220,7 +199,6 @@ while True:
                 if not price:
                     continue
 
-                # Hardcoded keyword & price bounds pre-check
                 if required_keyword and required_keyword.lower() not in title.lower():
                     continue
                 if price < min_price or price > max_price:
@@ -231,7 +209,6 @@ while True:
                     print(f"    [SEEDING] Cached existing listing: {title} ({price} PLN)", flush=True)
                     continue
 
-                # 3. Pure Misprice Anomaly Evaluation via Gemini API
                 print(f"    [AI ANALYZING] Checking misprice anomaly: {title}", flush=True)
                 analysis = analyze_listing_with_gemini(title, price)
 
@@ -239,40 +216,34 @@ while True:
                 discount = analysis.get('discount_percentage', 0)
                 verdict = analysis.get('verdict', '')
 
-                # Filter out non-bargains (Requires rating >= 7 and discount >= 30%)
                 if rating < 7 or discount < 30:
                     print(f"    [SKIPPED] Not a heavy bargain — Rating: {rating}/10 | Discount: {discount}%", flush=True)
                     continue
-
-                # Only cache ID after meeting bargain criteria and attempting to notify
-                shown_ids.add(offer_id)
 
                 matches_found += 1
                 log_line = f"    [MATCH FOUND] {title} | {price} PLN | Rating: {rating}/10 | Discount: {discount}% | {offer_url}"
                 print(log_line, flush=True)
 
-                # Safely escape dynamic fields and format URL for MarkdownV2 compatibility
-                safe_title = escape_markdown_v2(title)
-                safe_verdict = escape_markdown_v2(verdict)
-                safe_price = escape_markdown_v2(f"{price} PLN")
-                safe_rating = escape_markdown_v2(str(rating))
-                safe_discount = escape_markdown_v2(str(discount))
-                safe_url = escape_url(offer_url)
+                # Safe HTML escaping for user content
+                safe_title = html.escape(title)
+                safe_verdict = html.escape(str(verdict))
+                safe_url = html.escape(offer_url)
 
                 message = (
-                    f"🚨 *BARGAIN ALERT*: {safe_title}\n\n"
-                    f"*Price*: {safe_price}\n"
-                    f"*AI Rating*: {safe_rating}/10 \\| *Discount*: {safe_discount}%\n"
-                    f"*Details*: {safe_verdict}\n\n"
-                    f"[View Listing on OLX]({safe_url})"
+                    f"🚨 <b>BARGAIN ALERT</b>: {safe_title}\n\n"
+                    f"<b>Price</b>: {price} PLN\n"
+                    f"<b>AI Rating</b>: {rating}/10 | <b>Discount</b>: {discount}%\n"
+                    f"<b>Details</b>: {safe_verdict}\n\n"
+                    f'<a href="{safe_url}">View Listing on OLX</a>'
                 )
                 
                 try:
                     notifier.send_message(message)
+                    # Only cache ID after successful message delivery
+                    shown_ids.add(offer_id)
                 except Exception as send_err:
                     print(f"    [TELEGRAM ERROR] Could not deliver alert: {send_err}", flush=True)
 
-            # Save state
             with open("shown_ids.json", "w") as f:
                 f.write(json.dumps(list(shown_ids)))
 
