@@ -61,6 +61,21 @@ headers = {
     'Cache-Control': 'max-age=0'
 }
 
+def escape_markdown_v2(text: str) -> str:
+    """Escapes reserved characters for Telegram MarkdownV2 format."""
+    if not text:
+        return ""
+    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in escape_chars:
+        text = str(text).replace(char, f'\\{char}')
+    return text
+
+def escape_url(url: str) -> str:
+    """Escapes characters inside Markdown link parenthesis."""
+    if not url:
+        return ""
+    return str(url).replace('\\', '\\\\').replace(')', '\\)')
+
 def enforce_newest_sort(url: str) -> str:
     """Ensures search[order]=created_at:desc is appended to the OLX URL."""
     if "search%5Border%5D=" in url or "search[order]=" in url:
@@ -128,7 +143,7 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
         return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "API check skipped"}
 
 INITIAL_RUN = True
-print("[INIT] Initialization complete with Gemini 3.5 Flash-Lite pipeline (.env secured). Starting scraper loop...", flush=True)
+print("[INIT] Initialization complete with MarkdownV2-safe pipeline (.env secured). Starting scraper loop...", flush=True)
 
 while True:
     print("\n--- Starting new OLX scrape cycle ---", flush=True)
@@ -233,7 +248,19 @@ while True:
                 log_line = f"    [MATCH FOUND] {title} | {price} PLN | Rating: {rating}/10 | Discount: {discount}% | {offer_url}"
                 print(log_line, flush=True)
 
-                notifier.send_message(f"🚨 BARGAIN ALERT: {title}\nPrice: {price} PLN\nAI Verdict: Rating {rating}/10 | Discount: {discount}% off adequate used price\nDetails: {verdict}\nLink: {offer_url}")
+                # Safely escape dynamic fields and format URL for MarkdownV2 compatibility
+                safe_title = escape_markdown_v2(title)
+                safe_verdict = escape_markdown_v2(verdict)
+                safe_url = escape_url(offer_url)
+
+                message = (
+                    f"🚨 BARGAIN ALERT: {safe_title}\n"
+                    f"Price: {price} PLN\n"
+                    f"AI Rating: {rating} out of 10, Discount: {discount}%\n"
+                    f"Details: {safe_verdict}\n"
+                    f"Link: [View on OLX]({safe_url})"
+                )
+                notifier.send_message(message)
 
             # Save state
             with open("shown_ids.json", "w") as f:
