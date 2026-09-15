@@ -34,11 +34,11 @@ MAX_AGE_DAYS = 14  # Cutoff for old listings
 dotenv.load_dotenv()
 notifier = Notifier()
 
-# Initialize Gemini Client safely using the environment variable
+# Initialize Gemini Client safely using environment variable
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Load cache safely and use a Set for O(1) lookup
+# Load cache safely using a Set for O(1) lookup
 try:
     with open("shown_ids.json", "r") as f:
         shown_ids_list = json.loads(f.read())
@@ -66,9 +66,10 @@ def escape_markdown_v2(text: str) -> str:
     if not text:
         return ""
     escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    text_str = str(text)
     for char in escape_chars:
-        text = str(text).replace(char, f'\\{char}')
-    return text
+        text_str = text_str.replace(char, f'\\{char}')
+    return text_str
 
 def escape_url(url: str) -> str:
     """Escapes characters inside Markdown link parenthesis."""
@@ -103,7 +104,7 @@ def is_listing_too_old(offer: dict, max_days=MAX_AGE_DAYS) -> bool:
         return False
 
 def analyze_listing_with_gemini(title: str, price: float, description: str = "") -> dict:
-    """Uses Gemini 3.5 Flash-Lite to spot massive price anomalies, calculating discount percentage and bargain ratings (1-10) against estimated used market value."""
+    """Uses Gemini 3.5 Flash-Lite to spot massive price anomalies."""
     if not gemini_client:
         return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "Gemini client uninitialized (missing API key)"}
 
@@ -117,7 +118,7 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
 
     Your tasks:
     1. Estimate the adequate, normal used market price for this specific guitar model in PLN.
-    2. Calculate the percentage discount of the listing price compared to that adequate used price (e.g., if normal used price is 2000 PLN and asking price is 1000 PLN, the discount is 50%).
+    2. Calculate the percentage discount of the listing price compared to that adequate used price.
     3. Assign a bargain rating from 1 to 10 (where 10 is an absolute once-in-a-year pricing error / massive steal).
     4. Provide a short verdict explaining the calculation and why it's mispriced.
     
@@ -143,7 +144,7 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
         return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "API check skipped"}
 
 INITIAL_RUN = True
-print("[INIT] Initialization complete with MarkdownV2-safe pipeline (.env secured). Starting scraper loop...", flush=True)
+print("[INIT] Initialization complete with MarkdownV2-safe pipeline. Starting scraper loop...", flush=True)
 
 while True:
     print("\n--- Starting new OLX scrape cycle ---", flush=True)
@@ -225,9 +226,8 @@ while True:
                 if price < min_price or price > max_price:
                     continue
 
-                shown_ids.add(offer_id)
-
                 if INITIAL_RUN:
+                    shown_ids.add(offer_id)
                     print(f"    [SEEDING] Cached existing listing: {title} ({price} PLN)", flush=True)
                     continue
 
@@ -244,6 +244,9 @@ while True:
                     print(f"    [SKIPPED] Not a heavy bargain — Rating: {rating}/10 | Discount: {discount}%", flush=True)
                     continue
 
+                # Only cache ID after meeting bargain criteria and attempting to notify
+                shown_ids.add(offer_id)
+
                 matches_found += 1
                 log_line = f"    [MATCH FOUND] {title} | {price} PLN | Rating: {rating}/10 | Discount: {discount}% | {offer_url}"
                 print(log_line, flush=True)
@@ -251,16 +254,23 @@ while True:
                 # Safely escape dynamic fields and format URL for MarkdownV2 compatibility
                 safe_title = escape_markdown_v2(title)
                 safe_verdict = escape_markdown_v2(verdict)
+                safe_price = escape_markdown_v2(f"{price} PLN")
+                safe_rating = escape_markdown_v2(str(rating))
+                safe_discount = escape_markdown_v2(str(discount))
                 safe_url = escape_url(offer_url)
 
                 message = (
-                    f"🚨 BARGAIN ALERT: {safe_title}\n"
-                    f"Price: {price} PLN\n"
-                    f"AI Rating: {rating} out of 10, Discount: {discount}%\n"
-                    f"Details: {safe_verdict}\n"
-                    f"Link: [View on OLX]({safe_url})"
+                    f"🚨 *BARGAIN ALERT*: {safe_title}\n\n"
+                    f"*Price*: {safe_price}\n"
+                    f"*AI Rating*: {safe_rating}/10 \\| *Discount*: {safe_discount}%\n"
+                    f"*Details*: {safe_verdict}\n\n"
+                    f"[View Listing on OLX]({safe_url})"
                 )
-                notifier.send_message(message)
+                
+                try:
+                    notifier.send_message(message)
+                except Exception as send_err:
+                    print(f"    [TELEGRAM ERROR] Could not deliver alert: {send_err}", flush=True)
 
             # Save state
             with open("shown_ids.json", "w") as f:
