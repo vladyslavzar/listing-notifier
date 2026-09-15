@@ -86,29 +86,34 @@ def is_listing_too_old(offer: dict, max_days=MAX_AGE_DAYS) -> bool:
         return False
 
 def analyze_listing_with_gemini(title: str, price: float, description: str = "") -> dict:
-    """Uses Gemini 3.5 Flash-Lite to spot massive price anomalies."""
+    """Uses Gemini 3.5 Flash-Lite with rigorous guitar valuation constraints."""
     if not gemini_client:
         return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "Gemini client uninitialized"}
 
     prompt = f"""
-    Analyze this OLX guitar listing to determine if it is a massive price anomaly or an extraordinarily mispriced bargain ("one-hit wonder"). 
-    Evaluate the instrument based on its title, description, and price against its realistic, adequate used market value in Poland.
-    
+    Analyze this OLX guitar listing to determine if it is a genuine, massive price anomaly or mispriced deal in the Polish used guitar market.
+
     Listing Title: {title}
-    Price: {price} PLN
+    Listing Price: {price} PLN
     Description: {description}
 
-    Your tasks:
-    1. Estimate the adequate, normal used market price for this specific guitar model in PLN.
-    2. Calculate the percentage discount of the listing price compared to that adequate used price.
-    3. Assign a bargain rating from 1 to 10 (where 10 is an absolute once-in-a-year pricing error / massive steal).
-    4. Provide a short verdict explaining the calculation and why it's mispriced.
-    
-    Return a valid JSON object ONLY with the following structure:
+    CRITICAL MARKET RULES:
+    1. EXACT MODEL & SUB-SERIES IDENTIFICATION:
+       - Distinguish budget/import lines from flagship/US/Japan lines carefully:
+         * Ibanez: AZ Standard/AZS (2000-2500 PLN used) vs AZ Premium (3500-4500 PLN) vs AZ Prestige (5500-7000+ PLN).
+         * G&L: Tribute Series (1800-2500 PLN used) vs USA Fullerton (5000+ PLN).
+         * Gibson: Les Paul Faded/Tribute/Studio (3000-4500 PLN used) vs Standard/Traditional (7000+ PLN).
+         * Fender: Squier / Player (1500-2500 PLN) vs American Professional (5500-7500 PLN).
+    2. AMBIGUOUS TITLES DEFAULT RULE:
+       - If a listing title lacks specific tier indicators (e.g. simply "G&L Stratocaster" or "Ibanez AZ"), default your baseline market value calculation to the LOWER-TIER/IMPORT model unless the description explicitly proves American/Prestige origin.
+    3. ACCURATE DISCOUNT PERCENTAGE:
+       - Calculate percentage discount strictly against typical Polish USED market value in PLN, NOT original retail MSRP.
+
+    Return a valid JSON object ONLY with this exact schema:
     {{
-        "bargain_rating": 1 to 10,
+        "bargain_rating": integer (1 to 10),
         "discount_percentage": integer or float,
-        "verdict": "Short explanation detailing adequate used price vs asking price and discount percentage"
+        "verdict": "Short explanation specifying exact detected sub-series, realistic used market value in PLN, and discount rationale."
     }}
     """
     try:
@@ -181,7 +186,7 @@ while True:
                     continue
 
                 offer_id = str(offer.get('id', ''))
-                
+
                 if offer_id in shown_ids:
                     continue
 
@@ -224,7 +229,7 @@ while True:
                 log_line = f"    [MATCH FOUND] {title} | {price} PLN | Rating: {rating}/10 | Discount: {discount}% | {offer_url}"
                 print(log_line, flush=True)
 
-                # Safe HTML escaping for user content
+                # Safe HTML escaping for dynamic string injection
                 safe_title = html.escape(title)
                 safe_verdict = html.escape(str(verdict))
                 safe_url = html.escape(offer_url)
@@ -236,10 +241,10 @@ while True:
                     f"<b>Details</b>: {safe_verdict}\n\n"
                     f'<a href="{safe_url}">View Listing on OLX</a>'
                 )
-                
+
                 try:
                     notifier.send_message(message)
-                    # Only cache ID after successful message delivery
+                    # Only mark listing cached once successfully delivered
                     shown_ids.add(offer_id)
                 except Exception as send_err:
                     print(f"    [TELEGRAM ERROR] Could not deliver alert: {send_err}", flush=True)
