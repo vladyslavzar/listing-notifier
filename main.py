@@ -6,6 +6,7 @@ import html
 import re
 import itertools
 import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 import dotenv
 from flask import Flask
@@ -15,12 +16,19 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
+# --- CONFIGURATION ---
+POLL_INTERVAL = 50  # Real-time event loop runs every 50 seconds
+SCRAPE_DELAY = 2    # Short pause between search queries
+MIN_DISCOUNT_THRESHOLD = 30.0  # Require >= 30% discount to fire alert
+MIN_SAVINGS_PLN = 300          # Require at least 300 PLN profit margin
+UAH_TO_PLN_RATE = 0.10         # Currency conversion (1 UAH ~ 0.10 PLN)
+
 # --- RENDER HEALTH-CHECK SERVER ---
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "OLX Bot is active", 200
+    return "OLX Real-Time Monitor is active", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -29,120 +37,85 @@ def run_flask():
 threading.Thread(target=run_flask, daemon=True).start()
 # ----------------------------------
 
-SCRAPE_DELAY_MIN = 5
-SCRAPE_DELAY_MAX = 10
-REPEAT_DELAY = 600
-MAX_AGE_DAYS = 2  # Cutoff: skip listings older than 2 days to prevent re-analyzing old bumped items
-
 dotenv.load_dotenv()
 notifier = Notifier()
 
 # --- GEMINI MULTI-KEY SETUP ---
-# Supports GEMINI_API_KEYS (comma-separated list) or falls back to single GEMINI_API_KEY
 raw_keys = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY") or ""
 api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
 
 if api_keys:
     key_pool = itertools.cycle(api_keys)
-    print(f"[INIT] Loaded {len(api_keys)} Gemini API key(s) into round-robin rotation.", flush=True)
+    print(f"[INIT] Loaded {len(api_keys)} Gemini API key(s) into rotation.", flush=True)
 else:
     key_pool = None
-    print("[INIT] Warning: No Gemini API keys found.", flush=True)
+    print("[INIT] Warning: No Gemini API keys configured.", flush=True)
 
-try:
-    with open("shown_ids.json", "r") as f:
-        shown_ids_list = json.loads(f.read())
-        shown_ids = set(str(x) for x in shown_ids_list)
-except Exception as e:
-    print(f"[INIT] Warning: Could not read shown_ids.json ({e}). Initializing empty cache.", flush=True)
-    shown_ids = set()
+# --- IN-MEMORY RECENT ID CACHE ---
+seen_ids = set()
+recent_id_queue = deque(maxlen=3000)
+
+def track_id(listing_id: str):
+    """Adds ID to seen set with rolling deque eviction."""
+    if len(recent_id_queue) >= 3000:
+        oldest = recent_id_queue.popleft()
+        seen_ids.discard(oldest)
+    seen_ids.add(listing_id)
+    recent_id_queue.append(listing_id)
 
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'pl-PL,pl;q=0.9,uk-UA;q=0.8,en;q=0.7',
     'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
     'Cache-Control': 'max-age=0'
 }
 
 def clean_description(raw_desc: str) -> str:
-    """Strips HTML tags from description string if present."""
+    """Strips HTML tags and normalizes whitespace."""
     if not raw_desc:
         return ""
     clean_text = re.sub(r'<[^>]+>', ' ', str(raw_desc))
     return ' '.join(clean_text.split())
 
 def enforce_newest_sort(url: str) -> str:
-    """Ensures search[order]=created_at:desc is appended to the OLX URL."""
+    """Ensures search[order]=created_at:desc is appended to the OLX query."""
     if "search%5Border%5D=" in url or "search[order]=" in url:
         return url
     separator = "&" if "?" in url else "?"
     return f"{url}{separator}search%5Border%5D=created_at%3Adesc"
 
-def is_listing_too_old(offer: dict, max_days=MAX_AGE_DAYS) -> bool:
-    """Checks created_time or pushup_time to skip listings older than max_days."""
-    raw_time = offer.get("created_time") or offer.get("pushup_time") or offer.get("created_at")
-    if not raw_time:
-        return False
-
-    try:
-        if isinstance(raw_time, str):
-            created_dt = datetime.fromisoformat(raw_time)
-        elif isinstance(raw_time, (int, float)):
-            created_dt = datetime.fromtimestamp(raw_time, tz=timezone.utc)
-        else:
-            return False
-
-        cutoff_date = datetime.now(created_dt.tzinfo) - timedelta(days=max_days)
-        return created_dt < cutoff_date
-    except Exception:
-        return False
-
-def analyze_listing_with_gemini(title: str, price: float, description: str = "") -> dict:
-    """Uses Gemini 3.5 Flash-Lite with multi-key round-robin rotation and automatic failover."""
+def estimate_market_value_gemini(title: str, price_pln: float, description: str = "") -> dict:
+    """Asks Gemini 2.5 Flash-Lite ONLY for estimated Polish secondhand market value in PLN."""
     if not key_pool:
-        return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "Gemini uninitialized"}
+        return {"estimated_market_value_pln": 0, "reasoning": "Gemini uninitialized"}
 
     prompt = f"""
-    Analyze this OLX guitar listing to determine if it is a genuine, massive price anomaly or mispriced deal in the Polish used guitar market.
+    Act as an expert secondhand electric guitar valuer in Poland (OLX/Allegro market).
 
     Listing Title: {title}
-    Listing Price: {price} PLN
-    Description: {description}
+    Listed Price Equivalent: {price_pln:.0f} PLN
+    Description: {description[:800]}
 
-    CRITICAL MARKET RULES:
-    1. EXACT MODEL & SUB-SERIES IDENTIFICATION:
-       - Distinguish budget/import lines from flagship/US/Japan lines carefully:
-         * Ibanez: AZ Standard/AZS (2000-2500 PLN used) vs AZ Premium (3500-4500 PLN) vs AZ Prestige (5500-7000+ PLN).
-         * G&L: Tribute Series (1800-2500 PLN used) vs USA Fullerton (5000+ PLN).
-         * Gibson: Les Paul Faded/Tribute/Studio (3000-4500 PLN used) vs Standard/Traditional (7000+ PLN).
-         * Fender: Squier / Player (1500-2500 PLN) vs American Professional (5500-7500 PLN).
-    2. AMBIGUOUS TITLES DEFAULT RULE:
-       - If a listing title lacks specific tier indicators (e.g. simply "G&L Stratocaster" or "Ibanez AZ"), default your baseline market value calculation to the LOWER-TIER/IMPORT model unless the description explicitly proves American/Prestige origin.
-    3. ACCURATE DISCOUNT PERCENTAGE:
-       - Calculate percentage discount strictly against typical Polish USED market value in PLN, NOT original retail MSRP.
+    TASK:
+    Identify the exact model/tier and estimate the realistic secondhand market value in Poland in PLN.
+    - Differentiate tiers carefully (e.g. Squier vs Player vs Am Pro; Tribute vs USA; AZ Standard vs Prestige).
+    - Base calculation on typical USED Polish market values in PLN, NOT MSRP.
+    - If title is ambiguous, default to lower-tier/import value unless description proves higher tier.
 
-    Return a valid JSON object ONLY with this exact schema:
+    Return valid JSON ONLY matching this schema:
     {{
-        "bargain_rating": integer (1 to 10),
-        "discount_percentage": integer or float,
-        "verdict": "Short explanation specifying exact detected sub-series, realistic used market value in PLN, and discount rationale."
+        "estimated_market_value_pln": integer,
+        "reasoning": "Short 1-2 sentence valuation summary specifying identified tier and typical PLN secondhand value."
     }}
     """
 
-    # Attempt request across available key pool
     for _ in range(len(api_keys)):
         current_key = next(key_pool)
         try:
             client = genai.Client(api_key=current_key)
             response = client.models.generate_content(
-                model='gemini-3.5-flash-lite',
+                model='gemini-2.5-flash-lite',
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -152,7 +125,7 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
             return json.loads(response.text)
         except APIError as e:
             if getattr(e, 'code', None) == 429 or "429" in str(e):
-                print(f"    [GEMINI RATE LIMITED] Key starting with {current_key[:6]}... exhausted. Rotating to next key...", flush=True)
+                print(f"    [GEMINI 429] Key exhaustion. Rotating key...", flush=True)
                 continue
             print(f"    [GEMINI API ERROR] {e}", flush=True)
             break
@@ -160,145 +133,170 @@ def analyze_listing_with_gemini(title: str, price: float, description: str = "")
             print(f"    [GEMINI ERROR] Unexpected error: {e}", flush=True)
             break
 
-    return {"bargain_rating": 5, "discount_percentage": 0, "verdict": "All Gemini API keys failed or rate-limited"}
+    return {"estimated_market_value_pln": 0, "reasoning": "All Gemini API keys failed or rate-limited"}
 
-INITIAL_RUN = True
-print("[INIT] Starting scraper loop with HTML notification formatting...", flush=True)
+def fetch_page_one_offers(search_config: dict) -> list:
+    """Fetches Page 1 of search result listings and returns parsed items."""
+    raw_url = search_config.get('url')
+    if not raw_url:
+        return []
 
-while True:
-    print("\n--- Starting new OLX scrape cycle ---", flush=True)
+    url = enforce_newest_sort(raw_url)
+    market = search_config.get('market', 'PL').upper()
+    min_price = search_config.get('min_price', 0)
+    max_price = search_config.get('max_price', 999999)
+    required_keyword = search_config.get('required_keyword', '').lower()
 
+    try:
+        response = requests.get(url, headers=headers, impersonate="chrome120", timeout=12)
+        if response.status_code != 200:
+            return []
+
+        data = response.text
+        start_tag = '__PRERENDERED_STATE__= "'
+        end_tag = 'window.__TAURUS__'
+
+        if start_tag not in data or end_tag not in data:
+            return []
+
+        data = data[data.find(start_tag) + len(start_tag):]
+        data = data[:data.find(end_tag)]
+        data = data[:data.rfind('";')]
+        data = data.encode().decode('unicode_escape')
+
+        parsed_json = json.loads(data)
+        offers = parsed_json.get("listing", {}).get("listing", {}).get("ads", [])
+
+        parsed_items = []
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
+
+            offer_id = f"{market}_{offer.get('id', '')}"
+            title = offer.get('title', '')
+            offer_url = offer.get('url', '')
+
+            raw_description = offer.get('description') or offer.get('snippet') or offer.get('textContent') or ''
+            description = clean_description(raw_description)
+
+            price_obj = offer.get("price") or {}
+            regular_price = price_obj.get("regularPrice") or {}
+            raw_price = regular_price.get("value", 0)
+
+            if not raw_price or raw_price <= 0:
+                continue
+
+            # Convert UAH to PLN equivalent if market is Ukraine
+            if market == "UA":
+                price_pln = raw_price * UAH_TO_PLN_RATE
+                orig_price_str = f"{int(raw_price)} UAH"
+            else:
+                price_pln = float(raw_price)
+                orig_price_str = f"{int(raw_price)} PLN"
+
+            if required_keyword and required_keyword not in title.lower():
+                continue
+            if raw_price < min_price or raw_price > max_price:
+                continue
+
+            parsed_items.append({
+                "id": offer_id,
+                "title": title,
+                "price_pln": price_pln,
+                "orig_price_str": orig_price_str,
+                "description": description,
+                "url": offer_url,
+                "market": "🇺🇦 OLX.ua" if market == "UA" else "🇵🇱 OLX.pl"
+            })
+
+        return parsed_items
+
+    except Exception as err:
+        print(f"    [FETCH ERROR] Failed reading search endpoint: {err}", flush=True)
+        return []
+
+def cold_start():
+    """Populates seen_ids with current Page 1 listings upon startup without firing alerts."""
+    print("[COLD START] Caching active Page 1 listings across all configured searches...", flush=True)
     try:
         with open("searches.json", "r") as f:
             searches = json.loads(f.read())
     except Exception as e:
-        print(f"[ERROR] Failed to read searches.json: {e}", flush=True)
-        time.sleep(REPEAT_DELAY)
+        print(f"[COLD START ERROR] Could not read searches.json: {e}", flush=True)
+        return
+
+    cached_count = 0
+    for search in searches:
+        items = fetch_page_one_offers(search)
+        for item in items:
+            track_id(item["id"])
+            cached_count += 1
+
+    print(f"[COLD START COMPLETE] Pre-cached {cached_count} existing listing IDs. Ready for real-time events.\n", flush=True)
+
+# --- MAIN REAL-TIME NOTIFIER LOOP ---
+cold_start()
+
+while True:
+    try:
+        with open("searches.json", "r") as f:
+            searches = json.loads(f.read())
+    except Exception as e:
+        print(f"[ERROR] Could not read searches.json: {e}", flush=True)
+        time.sleep(POLL_INTERVAL)
         continue
 
-    for index, search in enumerate(searches, start=1):
-        raw_url = search.get('url')
-        if not raw_url:
-            continue
+    for search in searches:
+        latest_items = fetch_page_one_offers(search)
 
-        url = enforce_newest_sort(raw_url)
-        min_price = search.get('min_price', 0)
-        max_price = search.get('max_price', 999999)
-        required_keyword = search.get('required_keyword', '')
+        for item in latest_items:
+            item_id = item["id"]
 
-        print(f"[{index}/{len(searches)}] Fetching: {url}", flush=True)
+            # Early exit: Stop evaluating as soon as an already processed ID is encountered
+            if item_id in seen_ids:
+                break
 
-        try:
-            response = requests.get(url, headers=headers, impersonate="chrome120", timeout=15)
-            print(f"    -> Response Status: {response.status_code}", flush=True)
+            # Instantly mark ID as seen
+            track_id(item_id)
 
-            if response.status_code != 200:
-                print(f"    [WARN] Skipped URL due to non-200 status code ({response.status_code})", flush=True)
-                continue
+            title = item["title"]
+            price_pln = item["price_pln"]
 
-            data = response.text
-            start_tag = '__PRERENDERED_STATE__= "'
-            end_tag = 'window.__TAURUS__'
+            print(f"[NEW LISTING DETECTED] ({item['market']}) {title} @ ~{int(price_pln)} PLN", flush=True)
 
-            if start_tag not in data or end_tag not in data:
-                print("    [WARN] Pre-rendered state JSON tags not found in response DOM.", flush=True)
-                continue
+            # Query Gemini for valuation estimate only
+            analysis = estimate_market_value_gemini(title, price_pln, item["description"])
+            estimated_val = analysis.get("estimated_market_value_pln", 0)
+            reasoning = analysis.get("reasoning", "")
 
-            data = data[data.find(start_tag) + len(start_tag):]
-            data = data[:data.find(end_tag)]
-            data = data[:data.rfind('";')]
-            data = data.encode().decode('unicode_escape')
+            if estimated_val > price_pln and estimated_val > 0:
+                discount_pct = ((estimated_val - price_pln) / estimated_val) * 100
+                savings_pln = estimated_val - price_pln
 
-            parsed_json = json.loads(data)
-            offers = parsed_json.get("listing", {}).get("listing", {}).get("ads", [])
+                print(f"    -> Valuation: ~{estimated_val} PLN | Discount: {discount_pct:.1f}% | Profit: ~{int(savings_pln)} PLN", flush=True)
 
-            matches_found = 0
-            for offer in offers:
-                if not isinstance(offer, dict):
-                    continue
+                # Pure Python threshold validation
+                if discount_pct >= MIN_DISCOUNT_THRESHOLD and savings_pln >= MIN_SAVINGS_PLN:
+                    safe_title = html.escape(title)
+                    safe_reasoning = html.escape(str(reasoning))
+                    safe_url = html.escape(item["url"])
 
-                offer_id = str(offer.get('id', ''))
+                    message = (
+                        f"🚨 <b>BARGAIN ALERT — {item['market']}</b> ({discount_pct:.1f}% OFF)\n\n"
+                        f"🎸 <b>Title:</b> {safe_title}\n"
+                        f"💰 <b>Listed Price:</b> ~{int(price_pln)} PLN ({item['orig_price_str']})\n"
+                        f"📈 <b>Est. Market Value:</b> ~{int(estimated_val)} PLN\n"
+                        f"💵 <b>Est. Margin:</b> ~{int(savings_pln)} PLN\n\n"
+                        f"💡 <b>Reasoning:</b> {safe_reasoning}\n\n"
+                        f'<a href="{safe_url}">View Listing on OLX</a>'
+                    )
 
-                # 1. Already analyzed/cached check
-                if offer_id in shown_ids:
-                    continue
+                    try:
+                        notifier.send_message(message)
+                        print(f"    [ALERT DISPATCHED] Sent Telegram notification for {title}", flush=True)
+                    except Exception as send_err:
+                        print(f"    [TELEGRAM ERROR] Failed sending alert: {send_err}", flush=True)
 
-                # 2. Fix A: Age check (Skip and cache if listing was created/bumped > MAX_AGE_DAYS ago)
-                if is_listing_too_old(offer):
-                    shown_ids.add(offer_id)
-                    continue
+        time.sleep(SCRAPE_DELAY)
 
-                title = offer.get('title', '')
-                offer_url = offer.get('url', '')
-
-                # Extract and clean listing description
-                raw_description = offer.get('description') or offer.get('snippet') or offer.get('textContent') or ''
-                description = clean_description(raw_description)
-
-                price_obj = offer.get("price") or {}
-                regular_price = price_obj.get("regularPrice") or {}
-                price = regular_price.get("value", 0)
-
-                if not price:
-                    continue
-
-                if required_keyword and required_keyword.lower() not in title.lower():
-                    continue
-                if price < min_price or price > max_price:
-                    continue
-
-                if INITIAL_RUN:
-                    shown_ids.add(offer_id)
-                    print(f"    [SEEDING] Cached existing listing: {title} ({price} PLN)", flush=True)
-                    continue
-
-                print(f"    [AI ANALYZING] Checking misprice anomaly: {title}", flush=True)
-                analysis = analyze_listing_with_gemini(title, price, description)
-
-                rating = analysis.get('bargain_rating', 0)
-                discount = analysis.get('discount_percentage', 0)
-                verdict = analysis.get('verdict', '')
-
-                if rating < 7 or discount < 30:
-                    # Mark non-bargains as checked so we don't re-query Gemini on next cycle
-                    shown_ids.add(offer_id)
-                    print(f"    [SKIPPED] Not a heavy bargain — Rating: {rating}/10 | Discount: {discount}%", flush=True)
-                    continue
-
-                matches_found += 1
-                log_line = f"    [MATCH FOUND] {title} | {price} PLN | Rating: {rating}/10 | Discount: {discount}% | {offer_url}"
-                print(log_line, flush=True)
-
-                safe_title = html.escape(title)
-                safe_verdict = html.escape(str(verdict))
-                safe_url = html.escape(offer_url)
-
-                message = (
-                    f"🚨 <b>BARGAIN ALERT</b>: {safe_title}\n\n"
-                    f"<b>Price</b>: {price} PLN\n"
-                    f"<b>AI Rating</b>: {rating}/10 | <b>Discount</b>: {discount}%\n"
-                    f"<b>Details</b>: {safe_verdict}\n\n"
-                    f'<a href="{safe_url}">View Listing on OLX</a>'
-                )
-
-                try:
-                    notifier.send_message(message)
-                    shown_ids.add(offer_id)
-                except Exception as send_err:
-                    print(f"    [TELEGRAM ERROR] Could not deliver alert: {send_err}", flush=True)
-
-            # Persist cached IDs to JSON file after processing each search page
-            with open("shown_ids.json", "w") as f:
-                f.write(json.dumps(list(shown_ids)))
-
-            if matches_found == 0 and not INITIAL_RUN:
-                print("    -> Parsed successfully (No new matching listings).", flush=True)
-
-        except Exception as err:
-            print(f"    [ERROR] Exception processing URL: {err}", flush=True)
-
-        time.sleep(random.uniform(SCRAPE_DELAY_MIN, SCRAPE_DELAY_MAX))
-
-    INITIAL_RUN = False
-    print(f"--- Cycle finished. Sleeping for {REPEAT_DELAY}s before next scan ---", flush=True)
-    time.sleep(REPEAT_DELAY)
+    time.sleep(POLL_INTERVAL)
