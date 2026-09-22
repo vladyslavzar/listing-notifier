@@ -19,13 +19,16 @@ class Notifier:
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": False
+            "link_preview_options": {
+                "is_disabled": False,
+                "prefer_large_media": True
+            }
         }
 
         response = requests.post(url, json=payload, timeout=10)
         
         if not response.ok:
-            logger.error(f"Failed to send message: {response.content}")
+            logger.error(f"Failed to send Telegram message: {response.text}")
             response.raise_for_status()
 
         return response.json()
