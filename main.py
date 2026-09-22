@@ -17,11 +17,13 @@ from google.genai import types
 from google.genai.errors import APIError
 
 # --- CONFIGURATION ---
-POLL_INTERVAL = 50  # Real-time event loop runs every 50 seconds
-SCRAPE_DELAY = 2    # Short pause between search queries
-MIN_DISCOUNT_THRESHOLD = 30.0  # Require >= 30% discount to fire alert
-MIN_SAVINGS_PLN = 300          # Require at least 300 PLN profit margin
-UAH_TO_PLN_RATE = 0.10         # Currency conversion (1 UAH ~ 0.10 PLN)
+POLL_INTERVAL = 30            # Event loop runs every 30 seconds for speed
+SCRAPE_DELAY = 1.5            # Pause between search endpoints
+MIN_DISCOUNT_THRESHOLD = 30.0 # Require >= 30% discount to fire alert
+MIN_SAVINGS_PLN = 300         # Require at least 300 PLN profit margin
+UAH_TO_PLN_RATE = 0.10        # Currency conversion (1 UAH ~ 0.10 PLN)
+MAX_LISTING_AGE_MINUTES = 30  # Strictly ignore listings older than 30 mins
+CACHE_FILE = "seen_ids.json"
 
 # --- RENDER HEALTH-CHECK SERVER ---
 app = Flask(__name__)
@@ -51,17 +53,32 @@ else:
     key_pool = None
     print("[INIT] Warning: No Gemini API keys configured.", flush=True)
 
-# --- IN-MEMORY RECENT ID CACHE ---
-seen_ids = set()
-recent_id_queue = deque(maxlen=3000)
+# --- PERSISTENT SEEN ID CACHE ---
+def load_seen_ids() -> set:
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                data = json.load(f)
+                return set(data)
+        except Exception as e:
+            print(f"[CACHE LOAD ERROR] {e}", flush=True)
+    return set()
+
+seen_ids = load_seen_ids()
+recent_id_queue = deque(seen_ids, maxlen=3000)
 
 def track_id(listing_id: str):
-    """Adds ID to seen set with rolling deque eviction."""
+    """Adds ID to seen set and persists to disk."""
     if len(recent_id_queue) >= 3000:
         oldest = recent_id_queue.popleft()
         seen_ids.discard(oldest)
     seen_ids.add(listing_id)
     recent_id_queue.append(listing_id)
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(list(seen_ids), f)
+    except Exception:
+        pass
 
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -99,7 +116,9 @@ def estimate_market_value_gemini(title: str, price_pln: float, description: str 
 
     TASK:
     Identify the exact model/tier and estimate the realistic secondhand market value in Poland in PLN.
-    - Differentiate tiers carefully (e.g. Squier vs Player vs Am Pro; Tribute vs USA; AZ Standard vs Prestige).
+    - CRITICAL: Differentiate ACOUSTIC/ELECTRO-ACOUSTIC guitars from ELECTRIC guitars (e.g., Ibanez Performance/PF acoustic series vs. 1970s Ibanez Performer electric series; Fender acoustic vs. Fender Stratocaster).
+    - If entry-level acoustic/classical guitar (e.g. Ibanez PF15, PF30, IJV, Fender FA), evaluate as basic acoustic (~200-500 PLN max), NOT as vintage electric.
+    - Differentiate electric tiers carefully (e.g. Squier vs Player vs Am Pro; Tribute vs USA; AZ Standard vs Prestige).
     - Base calculation on typical USED Polish market values in PLN, NOT MSRP.
     - If title is ambiguous, default to lower-tier/import value unless description proves higher tier.
 
@@ -135,7 +154,7 @@ def estimate_market_value_gemini(title: str, price_pln: float, description: str 
     return {"estimated_market_value_pln": 0, "reasoning": "All Gemini API keys failed or rate-limited"}
 
 def fetch_page_one_offers(search_config: dict) -> list:
-    """Fetches Page 1 of search result listings and returns parsed items."""
+    """Fetches Page 1 of search result listings and returns strictly NEW parsed items."""
     raw_url = search_config.get('url')
     if not raw_url:
         return []
@@ -171,6 +190,18 @@ def fetch_page_one_offers(search_config: dict) -> list:
             if not isinstance(offer, dict):
                 continue
 
+            # --- TIMESTAMP CREATION CHECK ---
+            created_at_str = offer.get('created_time') or offer.get('created_at') or ''
+            if created_at_str:
+                try:
+                    listing_dt = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                    now_dt = datetime.now(timezone.utc)
+                    if (now_dt - listing_dt) > timedelta(minutes=MAX_LISTING_AGE_MINUTES):
+                        # Skip older / refreshed listings
+                        continue
+                except Exception:
+                    pass
+
             offer_id = f"{market}_{offer.get('id', '')}"
             title = offer.get('title', '')
             offer_url = offer.get('url', '')
@@ -185,7 +216,6 @@ def fetch_page_one_offers(search_config: dict) -> list:
             if not raw_price or raw_price <= 0:
                 continue
 
-            # Convert UAH to PLN equivalent if market is Ukraine
             if market == "UA":
                 price_pln = raw_price * UAH_TO_PLN_RATE
                 orig_price_str = f"{int(raw_price)} UAH"
@@ -215,8 +245,8 @@ def fetch_page_one_offers(search_config: dict) -> list:
         return []
 
 def cold_start():
-    """Populates seen_ids with current Page 1 listings upon startup without firing alerts."""
-    print("[COLD START] Caching active Page 1 listings across all configured searches...", flush=True)
+    """Pre-caches active Page 1 listings into disk cache on startup."""
+    print("[COLD START] Caching active Page 1 listings across search configs...", flush=True)
     try:
         with open("searches.json", "r") as f:
             searches = json.loads(f.read())
@@ -231,7 +261,7 @@ def cold_start():
             track_id(item["id"])
             cached_count += 1
 
-    print(f"[COLD START COMPLETE] Pre-cached {cached_count} existing listing IDs. Ready for real-time events.\n", flush=True)
+    print(f"[COLD START COMPLETE] Pre-cached {cached_count} current IDs. Monitoring for new real-time listings...\n", flush=True)
 
 # --- MAIN REAL-TIME NOTIFIER LOOP ---
 cold_start()
@@ -251,11 +281,9 @@ while True:
         for item in latest_items:
             item_id = item["id"]
 
-            # Early exit: Stop evaluating as soon as an already processed ID is encountered
             if item_id in seen_ids:
                 break
 
-            # Instantly mark ID as seen
             track_id(item_id)
 
             title = item["title"]
@@ -263,7 +291,6 @@ while True:
 
             print(f"[NEW LISTING DETECTED] ({item['market']}) {title} @ ~{int(price_pln)} PLN", flush=True)
 
-            # Query Gemini for valuation estimate only
             analysis = estimate_market_value_gemini(title, price_pln, item["description"])
             estimated_val = analysis.get("estimated_market_value_pln", 0)
             reasoning = analysis.get("reasoning", "")
@@ -274,7 +301,6 @@ while True:
 
                 print(f"    -> Valuation: ~{estimated_val} PLN | Discount: {discount_pct:.1f}% | Profit: ~{int(savings_pln)} PLN", flush=True)
 
-                # Pure Python threshold validation
                 if discount_pct >= MIN_DISCOUNT_THRESHOLD and savings_pln >= MIN_SAVINGS_PLN:
                     safe_title = html.escape(title)
                     safe_reasoning = html.escape(str(reasoning))
