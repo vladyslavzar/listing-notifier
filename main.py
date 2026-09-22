@@ -86,7 +86,7 @@ def enforce_newest_sort(url: str) -> str:
     return f"{url}{separator}search%5Border%5D=created_at%3Adesc"
 
 def estimate_market_value_gemini(title: str, price_pln: float, description: str = "") -> dict:
-    """Asks Gemini 2.5 Flash-Lite ONLY for estimated Polish secondhand market value in PLN."""
+    """Asks Gemini 3.5 Flash-Lite ONLY for estimated Polish secondhand market value in PLN."""
     if not key_pool:
         return {"estimated_market_value_pln": 0, "reasoning": "Gemini uninitialized"}
 
@@ -115,11 +115,10 @@ def estimate_market_value_gemini(title: str, price_pln: float, description: str 
         try:
             client = genai.Client(api_key=current_key)
             response = client.models.generate_content(
-                model='gemini-2.5-flash-lite',
+                model='gemini-3.5-flash-lite',
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1
+                    response_mime_type="application/json"
                 ),
             )
             return json.loads(response.text)
